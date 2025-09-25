@@ -272,8 +272,41 @@ def preprocess_for_mrz(pil_img: Image.Image) -> Image.Image:
     out = ImageOps.autocontrast(out)
     return out
 
+def rotate_image(img, angle):
+    """Rotate an image (NumPy array or PIL Image) by multiples of 90 degrees."""
+    if isinstance(img, Image.Image):
+        arr = np.array(img)
+        mode = img.mode
+        rotated = arr
+        if angle == 90:
+            rotated = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
+        elif angle in (-90, 270):
+            rotated = cv2.rotate(arr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        elif angle in (180, -180):
+            rotated = cv2.rotate(arr, cv2.ROTATE_180)
+        elif angle % 360 == 0:
+            rotated = arr
+        else:
+            return img
+        if rotated is arr:
+            return img
+        return Image.fromarray(rotated).convert(mode)
+    elif isinstance(img, np.ndarray):
+        if angle == 90:
+            return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+        elif angle in (-90, 270):
+            return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        elif angle in (180, -180):
+            return cv2.rotate(img, cv2.ROTATE_180)
+        elif angle % 360 == 0:
+            return img
+        else:
+            return img
+    else:
+        return img
+
 def rotate_180(img: Image.Image) -> Image.Image:
-    return img.rotate(180, expand=True, resample=Image.BICUBIC)
+    return rotate_image(img, 180)
 
 # ================== НОРМАЛІЗАЦІЯ/ОЦІНКА ==================
 def _normalize_and_score(picked, fallback_note=None):
@@ -352,45 +385,100 @@ def _good_enough(row_core):
     vs = row_core.get("valid_score") or 0
     return (vs >= EARLY_STOP_SCORE) and (row_core.get("doc_pass") is True or row_core.get("fin_pass") is True)
 
-def run_gpt_on_roi(pil_img, idx, total, print_raw=True):
-    roi, (W,H,y0) = make_roi(pil_img)
+def run_gpt_on_roi(pil_img, idx, total, print_raw=True, remaining_budget=None):
+    roi, (W, H, y0) = make_roi(pil_img)
     roi = ImageOps.autocontrast(roi.convert("L"))
-    data_url, jpg = pil_to_jpeg_data_url(roi)
-    model_res = call_gpt4o_mrz(data_url)
-    raw = model_res["raw"]
-    if idx <= PRINT_RAW_FIRST_N and print_raw:
-        print(f"\n🔎 Raw[{idx}/{total}] {pil_img.info.get('__debug','')}:\n{raw[:200]}{'...' if len(raw)>200 else ''}")
+    roi_w, roi_h = roi.size
+    vertical_hint = roi_h > roi_w * 1.2
 
-    picked, _ = pick_two_lines_from_text(raw)
-    fallback = None
-    if not picked:
-        t_text = pytesseract.image_to_string(roi, config=TESS_CFG)
-        picked_t, _ = pick_two_lines_from_text(t_text)
-        if picked_t:
-            picked = [pad44(picked_t[0]), pad44(picked_t[1])]
-            fallback = "tesseract"
+    budget = remaining_budget if remaining_budget is not None else MAX_GPT_TRIES
+    if budget <= 0:
+        raise RuntimeError("No GPT budget available for run_gpt_on_roi")
 
-    result_json, norm, issue_tags, valid_score, pass_doc, pass_fin = _normalize_and_score(picked, fallback)
+    gpt_calls = 0
+    attempts = []
 
-    row_core = {
-        "api_s": model_res["latency_s"],
-        "jpeg_kb": round(len(jpg)/1024,1),
-        "tokens_total": model_res.get("tokens",{}).get("total"),
-        "picked": 1 if picked else 0,
-        "fallback": fallback or "",
-        "valid_score": valid_score,
-        "doc_pass": pass_doc,
-        "fin_pass": pass_fin,
-        "issues": "|".join(issue_tags) if issue_tags else ""
-    }
-    meta = {
-        "image": {"orig_px":[W,H], "crop_from_y": y0, "crop_px":[roi.size[0], roi.size[1]], "jpeg_kb": round(len(jpg)/1024,1)},
-        "model": {"name": MODEL, "temperature": TEMPERATURE, **model_res.get("tokens",{})},
-        "latency_s": {"api": model_res["latency_s"]},
-        "raw": raw, "picked": picked, "norm": norm,
-        "issues": issue_tags, "fallback": fallback or ""
-    }
-    return row_core, meta, result_json
+    def make_attempt(img, angle, log_raw=False):
+        nonlocal gpt_calls
+        if gpt_calls >= budget:
+            return None
+        data_url, jpg = pil_to_jpeg_data_url(img)
+        model_res = call_gpt4o_mrz(data_url)
+        gpt_calls += 1
+        raw = model_res["raw"]
+        if idx <= PRINT_RAW_FIRST_N and log_raw:
+            print(f"\n🔎 Raw[{idx}/{total}] {pil_img.info.get('__debug','')}:\n{raw[:200]}{'...' if len(raw)>200 else ''}")
+
+        picked, _ = pick_two_lines_from_text(raw)
+        fallback = None
+        if not picked:
+            t_text = pytesseract.image_to_string(img, config=TESS_CFG)
+            picked_t, _ = pick_two_lines_from_text(t_text)
+            if picked_t:
+                picked = [pad44(picked_t[0]), pad44(picked_t[1])]
+                fallback = "tesseract"
+
+        result_json, norm, issue_tags, valid_score, pass_doc, pass_fin = _normalize_and_score(picked, fallback)
+        jpeg_kb = round(len(jpg)/1024, 1)
+        row_core = {
+            "api_s": model_res["latency_s"],
+            "jpeg_kb": jpeg_kb,
+            "tokens_total": model_res.get("tokens", {}).get("total"),
+            "picked": 1 if picked else 0,
+            "fallback": fallback or "",
+            "valid_score": valid_score,
+            "doc_pass": pass_doc,
+            "fin_pass": pass_fin,
+            "issues": "|".join(issue_tags) if issue_tags else "",
+            "rotation_angle": angle
+        }
+        meta = {
+            "image": {"orig_px": [W, H], "crop_from_y": y0, "crop_px": [img.size[0], img.size[1]], "jpeg_kb": jpeg_kb},
+            "model": {"name": MODEL, "temperature": TEMPERATURE, **model_res.get("tokens", {})},
+            "latency_s": {"api": model_res["latency_s"]},
+            "raw": raw, "picked": picked, "norm": norm,
+            "issues": issue_tags, "fallback": fallback or "",
+            "rotation_angle": angle
+        }
+        attempts.append({"row": row_core, "meta": meta, "json": result_json, "score": valid_score or 0})
+        return attempts[-1]
+
+    base_attempt = make_attempt(roi, 0, log_raw=print_raw)
+    if base_attempt is None:
+        raise RuntimeError("Failed to execute GPT base attempt")
+
+    def best_attempt(current_best, candidate):
+        if candidate is None:
+            return current_best
+        best_score = current_best["score"] if current_best else -1
+        cand_score = candidate["score"]
+        if cand_score > best_score:
+            return candidate
+        return current_best
+
+    best = base_attempt
+    perfect = (best["score"] >= 100) and (best["row"].get("doc_pass") or best["row"].get("fin_pass"))
+
+    if not perfect and gpt_calls < budget:
+        angles = [90, -90]
+        if vertical_hint:
+            angles = [90, -90]
+        for angle in angles:
+            if gpt_calls >= budget:
+                break
+            rot_img = rotate_image(roi, angle)
+            attempt = make_attempt(rot_img, angle)
+            best = best_attempt(best, attempt)
+            perfect = (best["score"] >= 100) and (best["row"].get("doc_pass") or best["row"].get("fin_pass"))
+            if perfect:
+                break
+
+    best_row = best["row"].copy()
+    best_row["gpt_calls"] = gpt_calls
+    best_meta = best["meta"].copy()
+    best_meta["gpt_calls"] = gpt_calls
+    best_meta["attempted_angles"] = [att["row"].get("rotation_angle") for att in attempts]
+    return best_row, best_meta, best["json"]
 
 # ================== ПАЙПЛАЙН НА ФАЙЛ ==================
 def set_dbg(pil, tag): pil.info["__debug"] = tag; return pil
@@ -398,23 +486,57 @@ def set_dbg(pil, tag): pil.info["__debug"] = tag; return pil
 def try_tesseract_first(base_rgb):
     roi, _ = make_roi(base_rgb)
     roi = ImageOps.autocontrast(roi.convert("L"))
-    t_text = pytesseract.image_to_string(roi, config=TESS_CFG)
-    picked, _ = pick_two_lines_from_text(t_text)
-    if not picked: return None, None
-    result_json, norm, issue_tags, valid_score, pass_doc, pass_fin = _normalize_and_score(picked, "tesseract-first")
-    row_core = {
-        "api_s": 0.0,
-        "jpeg_kb": None,
-        "tokens_total": 0,
-        "picked": 1 if picked else 0,
-        "fallback": "tesseract",
-        "valid_score": valid_score,
-        "doc_pass": pass_doc,
-        "fin_pass": pass_fin,
-        "issues": "|".join(issue_tags) if issue_tags else ""
-    }
-    meta = {"tesseract_first": True, "raw": t_text, "picked": picked, "norm": norm}
-    return row_core, (meta, result_json)
+    roi_w, roi_h = roi.size
+    vertical_hint = roi_h > roi_w * 1.2
+
+    angle_plan = []
+    if vertical_hint:
+        angle_plan.extend([90, -90])
+        angle_plan.extend([0, 180])
+    else:
+        angle_plan.extend([0, 180])
+        angle_plan.extend([90, -90])
+
+    best = None
+    best_score = -1
+
+    for angle in angle_plan:
+        rot_img = rotate_image(roi, angle)
+        t_text = pytesseract.image_to_string(rot_img, config=TESS_CFG)
+        picked, _ = pick_two_lines_from_text(t_text)
+        if not picked:
+            continue
+        note = f"tesseract-first-angle={angle}"
+        result_json, norm, issue_tags, valid_score, pass_doc, pass_fin = _normalize_and_score(picked, note)
+        row_core = {
+            "api_s": 0.0,
+            "jpeg_kb": None,
+            "tokens_total": 0,
+            "picked": 1 if picked else 0,
+            "fallback": "tesseract",
+            "valid_score": valid_score,
+            "doc_pass": pass_doc,
+            "fin_pass": pass_fin,
+            "issues": "|".join(issue_tags) if issue_tags else "",
+            "rotation_angle": angle
+        }
+        meta = {
+            "tesseract_first": True,
+            "raw": t_text,
+            "picked": picked,
+            "norm": norm,
+            "rotation_angle": angle
+        }
+        score_cmp = -1 if valid_score is None else valid_score
+        if score_cmp > best_score:
+            best = (row_core, (meta, result_json))
+            best_score = score_cmp
+        if score_cmp >= 100:
+            break
+
+    if best is None:
+        return None, None
+    return best
 
 def process_one_v25(fname, data_bytes, idx, total):
     T0 = time.time()
@@ -454,9 +576,12 @@ def process_one_v25(fname, data_bytes, idx, total):
     # 1) GPT base 0°
     tries = 0
     base0 = set_dbg(base_img.copy(), f"{fname} | base0")
-    row_core, meta_core, result_json = run_gpt_on_roi(base0, idx, total, print_raw=True)
+    row_core, meta_core, result_json = run_gpt_on_roi(base0, idx, total, print_raw=True,
+                                                     remaining_budget=MAX_GPT_TRIES - tries)
     best = {"row": row_core, "meta": meta_core, "json": result_json, "label": "base0", "rot": 0, "pre": 0}
-    tries += 1
+    tries += row_core.get("gpt_calls", 0) or 0
+    if tries == 0:
+        tries = 1
     if _good_enough(best["row"]) or tries >= MAX_GPT_TRIES:
         T1 = time.time()
         return {
@@ -477,10 +602,11 @@ def process_one_v25(fname, data_bytes, idx, total):
 
     if USE_ROTATION_180_IF_WEAK and _weak(best["row"]) and tries < MAX_GPT_TRIES:
         rot180 = set_dbg(rotate_180(base_img), f"{fname} | rot180")
-        r_row, r_meta, r_json = run_gpt_on_roi(rot180, idx, total, print_raw=False)
+        r_row, r_meta, r_json = run_gpt_on_roi(rot180, idx, total, print_raw=False,
+                                               remaining_budget=MAX_GPT_TRIES - tries)
         cand = {"row": r_row, "meta": r_meta, "json": r_json, "label": "rot180", "rot": 180, "pre": 0}
         best = better(best, cand)
-        tries += 1
+        tries += r_row.get("gpt_calls", 0) or 0
         if _good_enough(best["row"]) or tries >= MAX_GPT_TRIES:
             T1 = time.time()
             return {
@@ -496,10 +622,11 @@ def process_one_v25(fname, data_bytes, idx, total):
     # 3) Якщо все ще слабко → легкий препроцесинг 0°
     if USE_PREPROC_IF_WEAK and _weak(best["row"]) and tries < MAX_GPT_TRIES:
         pre0 = set_dbg(preprocess_for_mrz(base_img), f"{fname} | pre0")
-        p_row, p_meta, p_json = run_gpt_on_roi(pre0, idx, total, print_raw=False)
+        p_row, p_meta, p_json = run_gpt_on_roi(pre0, idx, total, print_raw=False,
+                                              remaining_budget=MAX_GPT_TRIES - tries)
         pcand = {"row": p_row, "meta": p_meta, "json": p_json, "label": "pre0", "rot": 0, "pre": 1}
         best = better(best, pcand)
-        tries += 1
+        tries += p_row.get("gpt_calls", 0) or 0
 
     T1 = time.time()
     out_row = {
