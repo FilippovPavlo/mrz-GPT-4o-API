@@ -110,16 +110,35 @@ def yymmdd_to_ddmmyyyy(s):
     except: return None
 
 def _split_name_safely(namefld: str):
-    if "<<" in namefld:
-        left, right = namefld.split("<<", 1)
-    elif "<" in namefld:
-        m = re.search(r"<+", namefld)
-        left, right = namefld[:m.start()], namefld[m.end():]
+    if not namefld:
+        return None, None
+
+    # відкидаємо службові заповнювачі в кінці, але лишаємо потенційні помилки OCR
+    core = namefld.rstrip("<")
+    if not core:
+        return None, None
+
+    # шукаємо першу пару «<<», яка розділяє прізвище та ім'я (не заповнювач «<<<<»)
+    split_at = None
+    for m in re.finditer(r"<<", core):
+        prev = core[m.start()-1] if m.start() > 0 else ""
+        nxt = core[m.end()] if m.end() < len(core) else ""
+        if prev != '<' and nxt != '<':
+            split_at = m.start()
+            break
+
+    if split_at is not None:
+        left = core[:split_at]
+        right = core[split_at+2:]
+    elif "<" in core:
+        m = re.search(r"<+", core)
+        left, right = core[:m.start()], core[m.end():]
     else:
-        return namefld.replace("<","") or None, None
+        left, right = core, ""
+
     surname = left.replace("<","").strip() or None
-    given = re.sub(r"<+", " ", right).strip()
-    given = re.sub(r"\s+", " ", given) or None
+    given_raw = re.sub(r"<+", " ", right).strip()
+    given = re.sub(r"\s+", " ", given_raw) or None
     return surname, given
 
 def _score(pass_doc, pass_dob, pass_exp, pass_pid, pass_fin):
@@ -318,8 +337,17 @@ def _normalize_and_score(picked, fallback_note=None):
 
         # попередження про одношевронні імена
         namefld = norm[0][5:44]
-        if "<<" not in namefld and "<" in namefld:
+        name_core = namefld.rstrip("<")
+        if name_core and "<<" not in name_core and "<" in name_core:
             issue_tags.append("name_single_chevron")
+
+        preview_surname, preview_given = _split_name_safely(namefld)
+        if preview_given:
+            tokens = [t for t in re.split(r"\s+", preview_given) if t]
+            single_letter_tokens = [t for t in tokens if len(t) == 1]
+            repetitive_tokens = [t for t in tokens if re.fullmatch(r"(.)\1{2,}", t)]
+            if (len(single_letter_tokens) >= 3 or repetitive_tokens) and "name_noise_tokens" not in issue_tags:
+                issue_tags.append("name_noise_tokens")
 
         # найкращий L2 за checksum-score
         best = _best_l2_by_score(norm[1])
@@ -350,9 +378,18 @@ def _normalize_and_score(picked, fallback_note=None):
     pass_fin = out3.get("final_pass")
     return result_json, norm, issue_tags, valid_score, pass_doc, pass_fin
 
+def _issue_set(row_core):
+    if not row_core:
+        return set()
+    issues = row_core.get("issues") or ""
+    return {p for p in issues.split("|") if p}
+
+FORCE_GPT_ISSUES = {"name_single_chevron", "name_noise_tokens"}
+
 def _weak(row_core):
     if row_core is None: return True
     if WEAK_IF_NO_PICK and not row_core.get("picked"): return True
+    if _issue_set(row_core) & FORCE_GPT_ISSUES: return True
     if REQUIRE_DOC_AND_FINAL and (row_core.get("doc_pass") is False and row_core.get("fin_pass") is False):
         return True
     vs = row_core.get("valid_score")
@@ -362,6 +399,8 @@ def _weak(row_core):
 def _good_enough(row_core):
     if row_core is None: return False
     vs = row_core.get("valid_score") or 0
+    if _issue_set(row_core) & FORCE_GPT_ISSUES:
+        return False
     return (vs >= EARLY_STOP_SCORE) and (row_core.get("doc_pass") is True and row_core.get("fin_pass") is True)
 
 def run_gpt_on_roi(pil_img, idx, total, print_raw=True):
@@ -460,13 +499,20 @@ def process_one_v25(fname, data_bytes, idx, total):
         }
 
     usage_log = []
-    tokens_prompt_total = 0
-    tokens_completion_total = 0
-    tokens_total_sum = 0
-    cost_total = 0.0
+
+    def usage_totals():
+        prompt_sum = sum(e.get("tokens_prompt", 0) or 0 for e in usage_log)
+        completion_sum = sum(e.get("tokens_completion", 0) or 0 for e in usage_log)
+        total_sum = sum(e.get("tokens_total", 0) or 0 for e in usage_log)
+        cost_sum = sum(e.get("cost_usd", 0.0) or 0.0 for e in usage_log)
+        return {
+            "prompt": int(prompt_sum),
+            "completion": int(completion_sum),
+            "total": int(total_sum),
+            "cost": cost_sum
+        }
 
     def register_usage(label, row_core):
-        nonlocal tokens_prompt_total, tokens_completion_total, tokens_total_sum, cost_total
         if not row_core:
             return
         entry = {
@@ -481,17 +527,14 @@ def process_one_v25(fname, data_bytes, idx, total):
             "issues": row_core.get("issues", "")
         }
         usage_log.append(entry)
-        tokens_prompt_total += entry["tokens_prompt"]
-        tokens_completion_total += entry["tokens_completion"]
-        tokens_total_sum += entry["tokens_total"]
-        cost_total += entry["cost_usd"]
 
     def emit_log(out_row):
+        totals = usage_totals()
         gpt_calls = sum(1 for e in usage_log if e["variant"] != "tesseract")
         print(
             f"🧾 {fname}: total_s={out_row.get('total_s')}s, valid_score={out_row.get('valid_score')}, "
-            f"tokens={out_row.get('tokens_total')} (prompt={out_row.get('tokens_prompt')}/comp={out_row.get('tokens_completion')}), "
-            f"gpt_calls={gpt_calls}, cost=${out_row.get('cost_usd'):.6f}, fallback={out_row.get('fallback') or '—'}, "
+            f"tokens={totals['total']} (prompt={totals['prompt']}/comp={totals['completion']}), "
+            f"gpt_calls={gpt_calls}, cost=${totals['cost']:.6f}, fallback={out_row.get('fallback') or '—'}, "
             f"issues={out_row.get('issues') or '—'}"
         )
         for e in usage_log:
@@ -503,15 +546,16 @@ def process_one_v25(fname, data_bytes, idx, total):
 
     def finalize(best_dict, tries_done):
         T1 = time.time()
+        totals = usage_totals()
         out_row = {
             "file": fname,
             "api_s": best_dict["row"].get("api_s", 0.0),
             "total_s": round(T1 - T0, 3),
             "jpeg_kb": best_dict["row"].get("jpeg_kb"),
-            "tokens_prompt": tokens_prompt_total,
-            "tokens_completion": tokens_completion_total,
-            "tokens_total": tokens_total_sum,
-            "cost_usd": round(cost_total, 6),
+            "tokens_prompt": totals["prompt"],
+            "tokens_completion": totals["completion"],
+            "tokens_total": totals["total"],
+            "cost_usd": round(totals["cost"], 6),
             "picked": best_dict["row"].get("picked"),
             "fallback": best_dict["row"].get("fallback"),
             "repair_strategy": "as_is",
@@ -536,15 +580,16 @@ def process_one_v25(fname, data_bytes, idx, total):
         register_usage("tesseract", t_row)
         if t_row["picked"] and t_row["valid_score"] and _good_enough(t_row):
             T1 = time.time()
+            totals = usage_totals()
             out_row = {
                 "file": fname,
                 "api_s": 0.0,
                 "total_s": round(T1 - T0, 3),
                 "jpeg_kb": None,
-                "tokens_prompt": tokens_prompt_total,
-                "tokens_completion": tokens_completion_total,
-                "tokens_total": tokens_total_sum,
-                "cost_usd": round(cost_total, 6),
+                "tokens_prompt": totals["prompt"],
+                "tokens_completion": totals["completion"],
+                "tokens_total": totals["total"],
+                "cost_usd": round(totals["cost"], 6),
                 "picked": 1,
                 "fallback": "tesseract",
                 "repair_strategy": "as_is",
@@ -662,7 +707,7 @@ if gt_key:
     s = gt_bytes.decode("utf-8", errors="ignore")
     reader = csv.DictReader(s.splitlines())
     for row in reader:
-        fn = (row.get("file") or "").strip()
+        fn = (row.get("file") or row.get("file_name") or "").strip()
         if not fn: continue
         gt_rows_raw[fn] = {k: (row.get(k) if row.get(k) not in ["", None] else None) for k in row.keys()}
     dprint(f"🟢 Ground truth loaded: {len(gt_rows_raw)} rows from '{gt_key}'")
@@ -740,6 +785,28 @@ for i, fname in enumerate(image_files, 1):
 print("\n✅ DONE. Batch summary:")
 print(json.dumps(rows, ensure_ascii=False, indent=2))
 print(f"\n📄 CSV: {OUT_CSV}\n🧾 JSONL: {OUT_JSONL}")
+
+print("\n🪪 Passport data:")
+for fname in image_files:
+    out3 = (json_results.get(fname) or {}).get("3", {}) or {}
+    passport_info = {
+        "file_name": canon_key(fname),
+        "country": out3.get("country"),
+        "date_of_birth": out3.get("date_of_birth"),
+        "expiration_date": out3.get("expiration_date"),
+        "mrz": out3.get("mrz"),
+        "mrz_type": out3.get("mrz_type"),
+        "names": out3.get("names"),
+        "nationality": out3.get("nationality"),
+        "number": out3.get("number"),
+        "sex": out3.get("sex"),
+        "surname": out3.get("surname"),
+    }
+    print("\n────────────")
+    for key, value in passport_info.items():
+        if value is None:
+            value = ""
+        print(f"[{key}] => {value}")
 
 if gt_rows_raw:
     print("\n📊 Ground Truth metrics per field:")
