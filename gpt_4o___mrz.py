@@ -1,11 +1,11 @@
 # ==== MRZ Batch v2.5-stable-lite ===========================================
 # Цілі:
 # 1) Стабільність: Tesseract → якщо валідно по checksum → приймаємо, GPT не викликаємо.
-# 2) Лише якщо слабко: GPT як fallback (1 ROI, 0°; за потреби 180°; за потреби легкий preproc).
-# 3) Ранній вихід: як тільки valid_score >= 80 і doc/final пройшли — стоп.
+# 2) Лише якщо слабко: GPT як fallback (1 ROI, 0°; за потреби легкий preproc).
+# 3) Ранній вихід: як тільки valid_score >= 95 і doc/final пройшли — стоп.
 # 4) Обмеження витрат: максимум 3-4 виклики моделі на файл.
 # 5) Посилений system prompt, щоб уникати «вигаданих» GBR/UTO і т.п.
-# 6) Ротація й препроцесинг — суворо умовні.
+# 6) Препроцесинг — суворо умовний, без ротацій.
 #
 # Порівняно з v2.4 прибрані агресивні перебори, залишені лише безпечні сценарії.
 
@@ -29,14 +29,16 @@ CROP_BOTTOM = 0.30                 # нижні 30% (ROI для MRZ)
 DEBUG_PRINT = True
 PRINT_RAW_FIRST_N = 3
 
+GPT4O_PROMPT_COST_PER_1K = 0.005   # USD per 1K prompt tokens
+GPT4O_COMPLETION_COST_PER_1K = 0.015  # USD per 1K completion tokens
+
 OUT_CSV = "/content/mrz_batch_summary.csv"
 OUT_JSONL = "/content/mrz_batch_logs.jsonl"
 OUT_METRICS = "/content/mrz_gt_metrics.json"
 
 # ---- Стратегія спроб ----
-EARLY_STOP_SCORE = 80              # як тільки >=80 і doc/final пройшли — стоп
-MAX_GPT_TRIES = 3                  # максимум викликів GPT на файл (base0, rot180, preproc0)
-USE_ROTATION_180_IF_WEAK = True    # дозволяти 180° тільки якщо слабко
+EARLY_STOP_SCORE = 95              # як тільки >=95 і doc/final пройшли — стоп
+MAX_GPT_TRIES = 3                  # максимум викликів GPT на файл (base0, preproc0)
 USE_PREPROC_IF_WEAK = True         # дозволяти легкий preproc тільки якщо слабко
 
 # Пороги «слабко»:
@@ -52,6 +54,14 @@ TESS_CFG = r'--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWX
 # ================== УТИЛІТИ ==================
 def dprint(*a, **kw):
     if DEBUG_PRINT: print(*a, **kw)
+
+def calc_gpt4o_cost(prompt_tokens: int, completion_tokens: int) -> float:
+    prompt_tokens = prompt_tokens or 0
+    completion_tokens = completion_tokens or 0
+    return (
+        prompt_tokens * GPT4O_PROMPT_COST_PER_1K +
+        completion_tokens * GPT4O_COMPLETION_COST_PER_1K
+    ) / 1000.0
 
 def normalize_chevrons(text: str) -> str:
     if not text: return text
@@ -220,15 +230,20 @@ def call_gpt4o_mrz(data_url, system_txt=SYSTEM_PROMPT):
     out = {
         "raw": (resp.choices[0].message.content or "").strip(),
         "latency_s": round(t1 - t0, 3),
-        "tokens": {}
+        "tokens": {},
+        "cost_usd": 0.0
     }
     try:
+        prompt_tokens = resp.usage.prompt_tokens or 0
+        completion_tokens = resp.usage.completion_tokens or 0
         out["tokens"] = {
-            "prompt": resp.usage.prompt_tokens,
-            "completion": resp.usage.completion_tokens,
-            "total": resp.usage.total_tokens
+            "prompt": prompt_tokens,
+            "completion": completion_tokens,
+            "total": resp.usage.total_tokens or (prompt_tokens + completion_tokens)
         }
-    except: pass
+        out["cost_usd"] = round(calc_gpt4o_cost(prompt_tokens, completion_tokens), 6)
+    except Exception:
+        pass
     return out
 
 def pick_two_lines_from_text(raw_text: str):
@@ -271,9 +286,6 @@ def preprocess_for_mrz(pil_img: Image.Image) -> Image.Image:
     out = Image.fromarray(thr)
     out = ImageOps.autocontrast(out)
     return out
-
-def rotate_180(img: Image.Image) -> Image.Image:
-    return img.rotate(180, expand=True, resample=Image.BICUBIC)
 
 # ================== НОРМАЛІЗАЦІЯ/ОЦІНКА ==================
 def _normalize_and_score(picked, fallback_note=None):
@@ -350,7 +362,7 @@ def _weak(row_core):
 def _good_enough(row_core):
     if row_core is None: return False
     vs = row_core.get("valid_score") or 0
-    return (vs >= EARLY_STOP_SCORE) and (row_core.get("doc_pass") is True or row_core.get("fin_pass") is True)
+    return (vs >= EARLY_STOP_SCORE) and (row_core.get("doc_pass") is True and row_core.get("fin_pass") is True)
 
 def run_gpt_on_roi(pil_img, idx, total, print_raw=True):
     roi, (W,H,y0) = make_roi(pil_img)
@@ -372,10 +384,14 @@ def run_gpt_on_roi(pil_img, idx, total, print_raw=True):
 
     result_json, norm, issue_tags, valid_score, pass_doc, pass_fin = _normalize_and_score(picked, fallback)
 
+    tokens_info = model_res.get("tokens", {})
     row_core = {
         "api_s": model_res["latency_s"],
         "jpeg_kb": round(len(jpg)/1024,1),
-        "tokens_total": model_res.get("tokens",{}).get("total"),
+        "tokens_prompt": tokens_info.get("prompt", 0) or 0,
+        "tokens_completion": tokens_info.get("completion", 0) or 0,
+        "tokens_total": tokens_info.get("total", 0) or 0,
+        "cost_usd": model_res.get("cost_usd", 0.0) or 0.0,
         "picked": 1 if picked else 0,
         "fallback": fallback or "",
         "valid_score": valid_score,
@@ -385,7 +401,7 @@ def run_gpt_on_roi(pil_img, idx, total, print_raw=True):
     }
     meta = {
         "image": {"orig_px":[W,H], "crop_from_y": y0, "crop_px":[roi.size[0], roi.size[1]], "jpeg_kb": round(len(jpg)/1024,1)},
-        "model": {"name": MODEL, "temperature": TEMPERATURE, **model_res.get("tokens",{})},
+        "model": {"name": MODEL, "temperature": TEMPERATURE, **tokens_info, "cost_usd": model_res.get("cost_usd", 0.0)},
         "latency_s": {"api": model_res["latency_s"]},
         "raw": raw, "picked": picked, "norm": norm,
         "issues": issue_tags, "fallback": fallback or ""
@@ -405,7 +421,10 @@ def try_tesseract_first(base_rgb):
     row_core = {
         "api_s": 0.0,
         "jpeg_kb": None,
+        "tokens_prompt": 0,
+        "tokens_completion": 0,
         "tokens_total": 0,
+        "cost_usd": 0.0,
         "picked": 1 if picked else 0,
         "fallback": "tesseract",
         "valid_score": valid_score,
@@ -422,97 +441,155 @@ def process_one_v25(fname, data_bytes, idx, total):
         base_img = Image.open(io.BytesIO(data_bytes)).convert("RGB")
     except UnidentifiedImageError:
         empty_meta = {
-            "file": fname, "api_s": 0, "total_s": 0, "jpeg_kb": 0, "tokens_total": 0,
+            "file": fname, "api_s": 0, "total_s": 0, "jpeg_kb": 0,
+            "tokens_prompt": 0, "tokens_completion": 0, "tokens_total": 0, "cost_usd": 0.0,
             "picked": 0, "fallback": "", "repair_strategy": None, "valid_score": None,
-            "doc_pass": None, "fin_pass": None, "issues": "not_an_image"
+            "doc_pass": None, "fin_pass": None, "issues": "not_an_image",
+            "preproc_used": 0, "extra_tries": 0
         }
+        print(f"🛑 {fname}: UnidentifiedImageError")
         return empty_meta, {"file": fname, "error": "UnidentifiedImageError"}, {
-            "0":{"status":"success"},"1":{"message":"Skipped non-image"},"2":{"hash":None},
+            "0": {"status": "success"}, "1": {"message": "Skipped non-image"}, "2": {"hash": None},
             "3": {k: None for k in [
-                "country","date_of_birth","date_of_issue","expiration_date","mrz","mrz_type",
-                "names","nationality","number","photo","sex","surname",
-                "personal_number","document_number_check","birth_check","expiry_check",
-                "personal_number_check","final_check","document_number_pass","birth_pass",
-                "expiry_pass","personal_number_pass","final_pass","valid_score"
+                "country", "date_of_birth", "date_of_issue", "expiration_date", "mrz", "mrz_type",
+                "names", "nationality", "number", "photo", "sex", "surname",
+                "personal_number", "document_number_check", "birth_check", "expiry_check",
+                "personal_number_check", "final_check", "document_number_pass", "birth_pass",
+                "expiry_pass", "personal_number_pass", "final_pass", "valid_score"
             ]}
         }
 
+    usage_log = []
+    tokens_prompt_total = 0
+    tokens_completion_total = 0
+    tokens_total_sum = 0
+    cost_total = 0.0
+
+    def register_usage(label, row_core):
+        nonlocal tokens_prompt_total, tokens_completion_total, tokens_total_sum, cost_total
+        if not row_core:
+            return
+        entry = {
+            "variant": label,
+            "latency_s": round(row_core.get("api_s", 0.0), 3),
+            "tokens_prompt": row_core.get("tokens_prompt", 0) or 0,
+            "tokens_completion": row_core.get("tokens_completion", 0) or 0,
+            "tokens_total": row_core.get("tokens_total", 0) or 0,
+            "cost_usd": row_core.get("cost_usd", 0.0) or 0.0,
+            "valid_score": row_core.get("valid_score"),
+            "fallback": row_core.get("fallback"),
+            "issues": row_core.get("issues", "")
+        }
+        usage_log.append(entry)
+        tokens_prompt_total += entry["tokens_prompt"]
+        tokens_completion_total += entry["tokens_completion"]
+        tokens_total_sum += entry["tokens_total"]
+        cost_total += entry["cost_usd"]
+
+    def emit_log(out_row):
+        gpt_calls = sum(1 for e in usage_log if e["variant"] != "tesseract")
+        print(
+            f"🧾 {fname}: total_s={out_row.get('total_s')}s, valid_score={out_row.get('valid_score')}, "
+            f"tokens={out_row.get('tokens_total')} (prompt={out_row.get('tokens_prompt')}/comp={out_row.get('tokens_completion')}), "
+            f"gpt_calls={gpt_calls}, cost=${out_row.get('cost_usd'):.6f}, fallback={out_row.get('fallback') or '—'}, "
+            f"issues={out_row.get('issues') or '—'}"
+        )
+        for e in usage_log:
+            print(
+                f"   • {e['variant']}: latency={e['latency_s']}s, tokens={e['tokens_total']} "
+                f"(prompt={e['tokens_prompt']}/comp={e['tokens_completion']}), cost=${e['cost_usd']:.6f}, "
+                f"score={e['valid_score']}, fallback={e['fallback'] or '—'}, issues={e['issues'] or '—'}"
+            )
+
+    def finalize(best_dict, tries_done):
+        T1 = time.time()
+        out_row = {
+            "file": fname,
+            "api_s": best_dict["row"].get("api_s", 0.0),
+            "total_s": round(T1 - T0, 3),
+            "jpeg_kb": best_dict["row"].get("jpeg_kb"),
+            "tokens_prompt": tokens_prompt_total,
+            "tokens_completion": tokens_completion_total,
+            "tokens_total": tokens_total_sum,
+            "cost_usd": round(cost_total, 6),
+            "picked": best_dict["row"].get("picked"),
+            "fallback": best_dict["row"].get("fallback"),
+            "repair_strategy": "as_is",
+            "valid_score": best_dict["row"].get("valid_score"),
+            "doc_pass": best_dict["row"].get("doc_pass"),
+            "fin_pass": best_dict["row"].get("fin_pass"),
+            "issues": best_dict["row"].get("issues"),
+            "preproc_used": best_dict.get("pre", 0),
+            "extra_tries": max(0, tries_done - 1)
+        }
+        meta_final = {
+            **{"file": fname, "picked_variant": best_dict["label"]},
+            **best_dict["meta"],
+            "usage_log": usage_log
+        }
+        emit_log(out_row)
+        return out_row, meta_final, best_dict["json"]
+
     # 0) Tesseract-first
     t_row, t_pack = try_tesseract_first(base_img)
-    if t_row and t_row["picked"] and t_row["valid_score"]:
-        if _good_enough(t_row):
+    if t_row:
+        register_usage("tesseract", t_row)
+        if t_row["picked"] and t_row["valid_score"] and _good_enough(t_row):
             T1 = time.time()
             out_row = {
-                "file": fname, "api_s": 0.0, "total_s": round(T1-T0,3), "jpeg_kb": None, "tokens_total": 0,
-                "picked": 1, "fallback": "tesseract", "repair_strategy": "as_is",
-                "valid_score": t_row["valid_score"], "doc_pass": t_row["doc_pass"], "fin_pass": t_row["fin_pass"],
-                "issues": t_row["issues"], "rotation_used": 0, "preproc_used": 0, "extra_tries": 0
+                "file": fname,
+                "api_s": 0.0,
+                "total_s": round(T1 - T0, 3),
+                "jpeg_kb": None,
+                "tokens_prompt": tokens_prompt_total,
+                "tokens_completion": tokens_completion_total,
+                "tokens_total": tokens_total_sum,
+                "cost_usd": round(cost_total, 6),
+                "picked": 1,
+                "fallback": "tesseract",
+                "repair_strategy": "as_is",
+                "valid_score": t_row["valid_score"],
+                "doc_pass": t_row["doc_pass"],
+                "fin_pass": t_row["fin_pass"],
+                "issues": t_row["issues"],
+                "preproc_used": 0,
+                "extra_tries": 0
             }
-            meta_final = {"file": fname, "picked_variant": "tesseract", **(t_pack[0] or {})}
+            meta_final = {
+                **{"file": fname, "picked_variant": "tesseract"},
+                **(t_pack[0] or {}),
+                "usage_log": usage_log
+            }
+            emit_log(out_row)
             return out_row, meta_final, t_pack[1]
 
     # 1) GPT base 0°
     tries = 0
     base0 = set_dbg(base_img.copy(), f"{fname} | base0")
     row_core, meta_core, result_json = run_gpt_on_roi(base0, idx, total, print_raw=True)
-    best = {"row": row_core, "meta": meta_core, "json": result_json, "label": "base0", "rot": 0, "pre": 0}
+    register_usage("base0", row_core)
+    best = {"row": row_core, "meta": meta_core, "json": result_json, "label": "base0", "pre": 0}
     tries += 1
     if _good_enough(best["row"]) or tries >= MAX_GPT_TRIES:
-        T1 = time.time()
-        return {
-            "file": fname, "api_s": best["row"]["api_s"], "total_s": round(T1-T0,3),
-            "jpeg_kb": best["row"]["jpeg_kb"], "tokens_total": best["row"]["tokens_total"],
-            "picked": best["row"]["picked"], "fallback": best["row"]["fallback"],
-            "repair_strategy": "as_is", "valid_score": best["row"]["valid_score"],
-            "doc_pass": best["row"]["doc_pass"], "fin_pass": best["row"]["fin_pass"],
-            "issues": best["row"]["issues"], "rotation_used": best["rot"], "preproc_used": best["pre"],
-            "extra_tries": tries-1
-        }, {"file": fname, "picked_variant": best["label"], **best["meta"]}, best["json"]
+        return finalize(best, tries)
 
-    # 2) Якщо слабко → 180°
-    def better(a,b):
-        av = a["row"]["valid_score"] or 0
-        bv = b["row"]["valid_score"] or 0
+    def better(a, b):
+        av = (a["row"].get("valid_score") or 0)
+        bv = (b["row"].get("valid_score") or 0)
         return a if av >= bv else b
 
-    if USE_ROTATION_180_IF_WEAK and _weak(best["row"]) and tries < MAX_GPT_TRIES:
-        rot180 = set_dbg(rotate_180(base_img), f"{fname} | rot180")
-        r_row, r_meta, r_json = run_gpt_on_roi(rot180, idx, total, print_raw=False)
-        cand = {"row": r_row, "meta": r_meta, "json": r_json, "label": "rot180", "rot": 180, "pre": 0}
-        best = better(best, cand)
-        tries += 1
-        if _good_enough(best["row"]) or tries >= MAX_GPT_TRIES:
-            T1 = time.time()
-            return {
-                "file": fname, "api_s": best["row"]["api_s"], "total_s": round(T1-T0,3),
-                "jpeg_kb": best["row"]["jpeg_kb"], "tokens_total": best["row"]["tokens_total"],
-                "picked": best["row"]["picked"], "fallback": best["row"]["fallback"],
-                "repair_strategy": "as_is", "valid_score": best["row"]["valid_score"],
-                "doc_pass": best["row"]["doc_pass"], "fin_pass": best["row"]["fin_pass"],
-                "issues": best["row"]["issues"], "rotation_used": best["rot"], "preproc_used": best["pre"],
-                "extra_tries": tries-1
-            }, {"file": fname, "picked_variant": best["label"], **best["meta"]}, best["json"]
-
-    # 3) Якщо все ще слабко → легкий препроцесинг 0°
+    # 2) Якщо все ще слабко → легкий препроцесинг 0°
     if USE_PREPROC_IF_WEAK and _weak(best["row"]) and tries < MAX_GPT_TRIES:
         pre0 = set_dbg(preprocess_for_mrz(base_img), f"{fname} | pre0")
         p_row, p_meta, p_json = run_gpt_on_roi(pre0, idx, total, print_raw=False)
-        pcand = {"row": p_row, "meta": p_meta, "json": p_json, "label": "pre0", "rot": 0, "pre": 1}
+        register_usage("pre0", p_row)
+        pcand = {"row": p_row, "meta": p_meta, "json": p_json, "label": "pre0", "pre": 1}
         best = better(best, pcand)
         tries += 1
+        if _good_enough(best["row"]) or tries >= MAX_GPT_TRIES:
+            return finalize(best, tries)
 
-    T1 = time.time()
-    out_row = {
-        "file": fname, "api_s": best["row"]["api_s"], "total_s": round(T1-T0,3),
-        "jpeg_kb": best["row"]["jpeg_kb"], "tokens_total": best["row"]["tokens_total"],
-        "picked": best["row"]["picked"], "fallback": best["row"]["fallback"],
-        "repair_strategy": "as_is", "valid_score": best["row"]["valid_score"],
-        "doc_pass": best["row"]["doc_pass"], "fin_pass": best["row"]["fin_pass"],
-        "issues": best["row"]["issues"], "rotation_used": best["rot"], "preproc_used": best["pre"],
-        "extra_tries": tries-1
-    }
-    meta_final = {"file": fname, "picked_variant": best["label"], **best["meta"]}
-    return out_row, meta_final, best["json"]
+    return finalize(best, tries)
 
 # ================== GT/IO ==================
 def canon_key(name: str) -> str:
@@ -612,9 +689,10 @@ gt_by_file, gt_by_file_name = build_gt_indexes(gt_rows_raw)
 
 # CSV заголовок
 csv_fields = [
-    "file","api_s","total_s","jpeg_kb","tokens_total",
+    "file","api_s","total_s","jpeg_kb",
+    "tokens_prompt","tokens_completion","tokens_total","cost_usd",
     "picked","fallback","repair_strategy","valid_score","doc_pass","fin_pass",
-    "issues","rotation_used","preproc_used","extra_tries"
+    "issues","preproc_used","extra_tries"
 ]
 GT_FIELDS = ["country","date_of_birth","expiration_date","mrz","mrz_type","names","nationality","number","sex","surname"]
 if gt_rows_raw:
