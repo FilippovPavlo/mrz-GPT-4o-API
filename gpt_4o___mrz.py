@@ -790,7 +790,7 @@ print("\n🪪 Passport data:")
 for fname in image_files:
     out3 = (json_results.get(fname) or {}).get("3", {}) or {}
     passport_info = {
-        "file_name": canon_key(fname),
+        "file_name": os.path.splitext(fname)[0],
         "country": out3.get("country"),
         "date_of_birth": out3.get("date_of_birth"),
         "expiration_date": out3.get("expiration_date"),
