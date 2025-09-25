@@ -112,6 +112,66 @@ def _split_name_safely(namefld: str):
     given = re.sub(r"\s+", " ", given) or None
     return surname, given
 
+
+def _clean_name_component(value):
+    if not value:
+        return value
+    value = re.sub(r"[^A-Z ]", " ", value.upper())
+    tokens = [tok for tok in re.split(r"\s+", value) if tok]
+    if not tokens:
+        return None
+    cleaned = []
+    for idx, tok in enumerate(tokens):
+        uniq = set(tok)
+        if idx > 0 and len(tok) == 1:
+            continue
+        if idx > 0 and len(uniq) == 1 and len(tok) >= 3:
+            continue
+        cleaned.append(tok)
+    if not cleaned:
+        cleaned = tokens[:1]
+    return " ".join(cleaned)
+
+
+def _encode_name_field(surname, given):
+    def encode_part(part):
+        if not part:
+            return ""
+        part = re.sub(r"[^A-Z ]", " ", part.upper())
+        part = re.sub(r"\s+", " ", part).strip()
+        return part.replace(" ", "<")
+
+    surname_enc = encode_part(surname)
+    given_enc = encode_part(given)
+    field = surname_enc + "<<"
+    if given_enc:
+        field += given_enc
+    field = (field + "<" * 39)[:39]
+    return field
+
+
+def _clean_line1_names(l1):
+    original = l1
+    prefix = sanitize(l1[:5])
+    if len(prefix) < 5:
+        prefix = (prefix + "<" * 5)[:5]
+    namefld = l1[5:44]
+    surname, given = _split_name_safely(namefld)
+    cleaned_surname = _clean_name_component(surname) or surname
+    cleaned_given = _clean_name_component(given) or given
+    encoded_field = _encode_name_field(cleaned_surname, cleaned_given)
+    rebuilt = pad44(prefix + encoded_field)
+    changed = rebuilt != pad44(original)
+    meta = {
+        "line_before": pad44(original),
+        "line_after": rebuilt,
+        "surname_before": surname,
+        "surname_after": cleaned_surname,
+        "given_before": given,
+        "given_after": cleaned_given
+    }
+    return rebuilt, changed, meta
+
 def _score(pass_doc, pass_dob, pass_exp, pass_pid, pass_fin):
     return (30 if pass_doc else 0) + (25 if pass_dob else 0) + (25 if pass_exp else 0) + \
            (10 if pass_pid else 0) + (10 if pass_fin else 0)
@@ -337,7 +397,13 @@ def _normalize_and_score(picked, fallback_note=None):
 
         norm = [pad44(l1), pad44(l2)]
 
-        # попередження про одношевронні імена
+        # Попередня нормалізація імені: забезпечує << та прибирає шумові токени
+        cleaned_l1, l1_changed, name_meta = _clean_line1_names(norm[0])
+        if l1_changed:
+            issue_tags.append("l1_name_cleanup")
+        norm[0] = cleaned_l1
+
+        # попередження про одношевронні імена після чистки (має бути рідко)
         namefld = norm[0][5:44]
         if "<<" not in namefld and "<" in namefld:
             issue_tags.append("name_single_chevron")
@@ -349,6 +415,13 @@ def _normalize_and_score(picked, fallback_note=None):
             repair_meta = {"strategy": best["tag"], "score": best["score"], "checks": best["checks"],
                            "before": norm[1], "after": best["l2"], "fallback": fallback_note or ""}
             norm[1] = best["l2"]
+            result_json = build_json_from_lines(norm[0], norm[1], repair_meta)
+            if l1_changed:
+                repair_meta.setdefault("name_cleanup", name_meta)
+        elif l1_changed:
+            repair_meta = {"strategy": "as_is", "score": None, "checks": _checks_for_l2(norm[1]),
+                           "before": norm[1], "after": norm[1], "fallback": fallback_note or "",
+                           "name_cleanup": name_meta}
             result_json = build_json_from_lines(norm[0], norm[1], repair_meta)
 
     if result_json is None:
