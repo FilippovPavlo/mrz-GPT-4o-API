@@ -110,17 +110,89 @@ def yymmdd_to_ddmmyyyy(s):
     except: return None
 
 def _split_name_safely(namefld: str):
-    if "<<" in namefld:
-        left, right = namefld.split("<<", 1)
-    elif "<" in namefld:
-        m = re.search(r"<+", namefld)
-        left, right = namefld[:m.start()], namefld[m.end():]
+    if not namefld:
+        return None, None, {"raw_tokens": [], "clean_tokens": []}
+
+    # відкидаємо службові заповнювачі в кінці, але лишаємо потенційні помилки OCR
+    core = namefld.rstrip("<")
+    if not core:
+        return None, None, {"raw_tokens": [], "clean_tokens": []}
+
+    # шукаємо першу пару «<<», яка розділяє прізвище та ім'я (не заповнювач «<<<<»)
+    split_at = None
+    for m in re.finditer(r"<<", core):
+        prev = core[m.start()-1] if m.start() > 0 else ""
+        nxt = core[m.end()] if m.end() < len(core) else ""
+        if prev != '<' and nxt != '<':
+            split_at = m.start()
+            break
+
+    if split_at is not None:
+        left = core[:split_at]
+        right = core[split_at+2:]
+    elif "<" in core:
+        m = re.search(r"<+", core)
+        left, right = core[:m.start()], core[m.end():]
     else:
-        return namefld.replace("<","") or None, None
+        left, right = core, ""
+
     surname = left.replace("<","").strip() or None
-    given = re.sub(r"<+", " ", right).strip()
-    given = re.sub(r"\s+", " ", given) or None
-    return surname, given
+    given_raw = re.sub(r"<+", " ", right).strip()
+    raw_tokens = [t for t in re.split(r"\s+", given_raw) if t]
+    longer_tokens = [t for t in raw_tokens if len(t) > 1]
+
+    cleaned_tokens = raw_tokens
+    if longer_tokens:
+        cleaned_tokens = [t for t in raw_tokens if len(t) > 1]
+    cleaned_tokens = [t for t in cleaned_tokens if not re.fullmatch(r"(.)\1{1,}", t)]
+    if not cleaned_tokens and longer_tokens:
+        cleaned_tokens = longer_tokens
+    if not cleaned_tokens and raw_tokens:
+        cleaned_tokens = raw_tokens
+
+    given = " ".join(cleaned_tokens) if cleaned_tokens else None
+    meta = {
+        "raw_tokens": raw_tokens,
+        "clean_tokens": cleaned_tokens,
+        "had_single_tokens": any(len(t) == 1 for t in raw_tokens),
+        "had_repetitive_tokens": any(re.fullmatch(r"(.)\1{1,}", t) for t in raw_tokens)
+    }
+    return surname, given, meta
+
+
+def _encode_mrz_name_part(part: str) -> str:
+    if not part:
+        return ""
+    part = part.upper()
+    part = re.sub(r"[^A-Z0-9]+", "<", part)
+    part = re.sub(r"<+", "<", part)
+    return part.strip("<")
+
+
+def rebuild_l1_with_names(line1: str, surname: str, given: str) -> str:
+    if not line1:
+        line1 = "P<"
+    base = pad44(line1)
+    doc_code = base[:2]
+    if len(doc_code) < 2:
+        doc_code = (doc_code + "<<")[:2]
+    country = sanitize(base[2:5])
+    if not country:
+        country = "<<<"
+    if len(country) < 3:
+        country = (country + "<<<")[:3]
+
+    surname_part = _encode_mrz_name_part(surname)
+    given_part = _encode_mrz_name_part(given)
+    if not (surname_part or given_part):
+        return base
+
+    name_field = surname_part + "<<"
+    if given_part:
+        name_field += given_part
+    name_field = name_field[:39]
+    name_field = name_field.ljust(39, "<")
+    return (doc_code + country + name_field)[:44]
 
 def _score(pass_doc, pass_dob, pass_exp, pass_pid, pass_fin):
     return (30 if pass_doc else 0) + (25 if pass_dob else 0) + (25 if pass_exp else 0) + \
@@ -166,7 +238,7 @@ def _best_l2_by_score(l2):
 
 def build_json_from_lines(l1, l2, repair_meta):
     namefld = l1[5:44]
-    surname, given = _split_name_safely(namefld)
+    surname, given, _ = _split_name_safely(namefld)
     number_raw=l2[0:9]; nat=l2[10:13]; dob=l2[13:19]; sex=l2[20]; exp=l2[21:27]; pid=l2[28:42]
     ch = repair_meta["checks"]
     return {
@@ -213,17 +285,30 @@ SYSTEM_PROMPT = (
     "unless they are clearly visible in the image. Keep line breaks between the two lines."
 )
 
-def call_gpt4o_mrz(data_url, system_txt=SYSTEM_PROMPT):
+FOCUSED_SYSTEM_PROMPT = (
+    SYSTEM_PROMPT +
+    " Validate all check digits and ensure the date fields strictly follow YYMMDD order. "
+    "Avoid stray filler like isolated letters in the given-names segment."
+)
+
+FOCUSED_USER_HINT = (
+    "The previous attempt had checksum failures or noise tokens. Re-evaluate carefully, "
+    "paying close attention to the expiration date and any trailing characters in the name field."
+)
+
+def call_gpt4o_mrz(data_url, system_txt=SYSTEM_PROMPT, extra_user_text=None):
     t0 = time.time()
+    user_content = []
+    if extra_user_text:
+        user_content.append({"type": "text", "text": extra_user_text})
+    user_content.append({"type": "text", "text": "Extract the two MRZ lines (TD3)."})
+    user_content.append({"type": "image_url", "image_url": {"url": data_url}})
     resp = client.chat.completions.create(
         model=MODEL,
         temperature=TEMPERATURE,
         messages=[
             {"role":"system","content":system_txt},
-            {"role":"user","content":[
-                {"type":"text","text":"Extract the two MRZ lines (TD3)."},
-                {"type":"image_url","image_url":{"url": data_url}}
-            ]}
+            {"role":"user","content":user_content}
         ]
     )
     t1 = time.time()
@@ -318,8 +403,20 @@ def _normalize_and_score(picked, fallback_note=None):
 
         # попередження про одношевронні імена
         namefld = norm[0][5:44]
-        if "<<" not in namefld and "<" in namefld:
+        name_core = namefld.rstrip("<")
+        if name_core and "<<" not in name_core and "<" in name_core:
             issue_tags.append("name_single_chevron")
+
+        preview_surname, preview_given, name_meta = _split_name_safely(namefld)
+        raw_tokens = name_meta.get("raw_tokens", [])
+        single_letter_tokens = [t for t in raw_tokens if len(t) == 1]
+        repetitive_tokens = [t for t in raw_tokens if re.fullmatch(r"(.)\1{2,}", t)]
+        if (len(single_letter_tokens) >= 3 or repetitive_tokens) and "name_noise_tokens" not in issue_tags:
+            issue_tags.append("name_noise_tokens")
+
+        if preview_surname or preview_given:
+            rebuilt_l1 = rebuild_l1_with_names(norm[0], preview_surname or "", preview_given or "")
+            norm[0] = pad44(rebuilt_l1)
 
         # найкращий L2 за checksum-score
         best = _best_l2_by_score(norm[1])
@@ -350,9 +447,18 @@ def _normalize_and_score(picked, fallback_note=None):
     pass_fin = out3.get("final_pass")
     return result_json, norm, issue_tags, valid_score, pass_doc, pass_fin
 
+def _issue_set(row_core):
+    if not row_core:
+        return set()
+    issues = row_core.get("issues") or ""
+    return {p for p in issues.split("|") if p}
+
+FORCE_GPT_ISSUES = {"name_single_chevron", "name_noise_tokens"}
+
 def _weak(row_core):
     if row_core is None: return True
     if WEAK_IF_NO_PICK and not row_core.get("picked"): return True
+    if _issue_set(row_core) & FORCE_GPT_ISSUES: return True
     if REQUIRE_DOC_AND_FINAL and (row_core.get("doc_pass") is False and row_core.get("fin_pass") is False):
         return True
     vs = row_core.get("valid_score")
@@ -362,13 +468,15 @@ def _weak(row_core):
 def _good_enough(row_core):
     if row_core is None: return False
     vs = row_core.get("valid_score") or 0
+    if _issue_set(row_core) & FORCE_GPT_ISSUES:
+        return False
     return (vs >= EARLY_STOP_SCORE) and (row_core.get("doc_pass") is True and row_core.get("fin_pass") is True)
 
-def run_gpt_on_roi(pil_img, idx, total, print_raw=True):
+def run_gpt_on_roi(pil_img, idx, total, print_raw=True, system_override=None, extra_user_text=None):
     roi, (W,H,y0) = make_roi(pil_img)
     roi = ImageOps.autocontrast(roi.convert("L"))
     data_url, jpg = pil_to_jpeg_data_url(roi)
-    model_res = call_gpt4o_mrz(data_url)
+    model_res = call_gpt4o_mrz(data_url, system_txt=system_override or SYSTEM_PROMPT, extra_user_text=extra_user_text)
     raw = model_res["raw"]
     if idx <= PRINT_RAW_FIRST_N and print_raw:
         print(f"\n🔎 Raw[{idx}/{total}] {pil_img.info.get('__debug','')}:\n{raw[:200]}{'...' if len(raw)>200 else ''}")
@@ -460,13 +568,20 @@ def process_one_v25(fname, data_bytes, idx, total):
         }
 
     usage_log = []
-    tokens_prompt_total = 0
-    tokens_completion_total = 0
-    tokens_total_sum = 0
-    cost_total = 0.0
+
+    def usage_totals():
+        prompt_sum = sum(e.get("tokens_prompt", 0) or 0 for e in usage_log)
+        completion_sum = sum(e.get("tokens_completion", 0) or 0 for e in usage_log)
+        total_sum = sum(e.get("tokens_total", 0) or 0 for e in usage_log)
+        cost_sum = sum(e.get("cost_usd", 0.0) or 0.0 for e in usage_log)
+        return {
+            "prompt": int(prompt_sum),
+            "completion": int(completion_sum),
+            "total": int(total_sum),
+            "cost": cost_sum
+        }
 
     def register_usage(label, row_core):
-        nonlocal tokens_prompt_total, tokens_completion_total, tokens_total_sum, cost_total
         if not row_core:
             return
         entry = {
@@ -481,17 +596,14 @@ def process_one_v25(fname, data_bytes, idx, total):
             "issues": row_core.get("issues", "")
         }
         usage_log.append(entry)
-        tokens_prompt_total += entry["tokens_prompt"]
-        tokens_completion_total += entry["tokens_completion"]
-        tokens_total_sum += entry["tokens_total"]
-        cost_total += entry["cost_usd"]
 
     def emit_log(out_row):
+        totals = usage_totals()
         gpt_calls = sum(1 for e in usage_log if e["variant"] != "tesseract")
         print(
             f"🧾 {fname}: total_s={out_row.get('total_s')}s, valid_score={out_row.get('valid_score')}, "
-            f"tokens={out_row.get('tokens_total')} (prompt={out_row.get('tokens_prompt')}/comp={out_row.get('tokens_completion')}), "
-            f"gpt_calls={gpt_calls}, cost=${out_row.get('cost_usd'):.6f}, fallback={out_row.get('fallback') or '—'}, "
+            f"tokens={totals['total']} (prompt={totals['prompt']}/comp={totals['completion']}), "
+            f"gpt_calls={gpt_calls}, cost=${totals['cost']:.6f}, fallback={out_row.get('fallback') or '—'}, "
             f"issues={out_row.get('issues') or '—'}"
         )
         for e in usage_log:
@@ -503,15 +615,16 @@ def process_one_v25(fname, data_bytes, idx, total):
 
     def finalize(best_dict, tries_done):
         T1 = time.time()
+        totals = usage_totals()
         out_row = {
             "file": fname,
             "api_s": best_dict["row"].get("api_s", 0.0),
             "total_s": round(T1 - T0, 3),
             "jpeg_kb": best_dict["row"].get("jpeg_kb"),
-            "tokens_prompt": tokens_prompt_total,
-            "tokens_completion": tokens_completion_total,
-            "tokens_total": tokens_total_sum,
-            "cost_usd": round(cost_total, 6),
+            "tokens_prompt": totals["prompt"],
+            "tokens_completion": totals["completion"],
+            "tokens_total": totals["total"],
+            "cost_usd": round(totals["cost"], 6),
             "picked": best_dict["row"].get("picked"),
             "fallback": best_dict["row"].get("fallback"),
             "repair_strategy": "as_is",
@@ -536,15 +649,16 @@ def process_one_v25(fname, data_bytes, idx, total):
         register_usage("tesseract", t_row)
         if t_row["picked"] and t_row["valid_score"] and _good_enough(t_row):
             T1 = time.time()
+            totals = usage_totals()
             out_row = {
                 "file": fname,
                 "api_s": 0.0,
                 "total_s": round(T1 - T0, 3),
                 "jpeg_kb": None,
-                "tokens_prompt": tokens_prompt_total,
-                "tokens_completion": tokens_completion_total,
-                "tokens_total": tokens_total_sum,
-                "cost_usd": round(cost_total, 6),
+                "tokens_prompt": totals["prompt"],
+                "tokens_completion": totals["completion"],
+                "tokens_total": totals["total"],
+                "cost_usd": round(totals["cost"], 6),
                 "picked": 1,
                 "fallback": "tesseract",
                 "repair_strategy": "as_is",
@@ -585,6 +699,19 @@ def process_one_v25(fname, data_bytes, idx, total):
         register_usage("pre0", p_row)
         pcand = {"row": p_row, "meta": p_meta, "json": p_json, "label": "pre0", "pre": 1}
         best = better(best, pcand)
+        tries += 1
+        if _good_enough(best["row"]) or tries >= MAX_GPT_TRIES:
+            return finalize(best, tries)
+
+    if _weak(best["row"]) and tries < MAX_GPT_TRIES:
+        focus_row, focus_meta, focus_json = run_gpt_on_roi(
+            base0, idx, total, print_raw=False,
+            system_override=FOCUSED_SYSTEM_PROMPT,
+            extra_user_text=FOCUSED_USER_HINT
+        )
+        register_usage("focus0", focus_row)
+        fcand = {"row": focus_row, "meta": focus_meta, "json": focus_json, "label": "focus0", "pre": 0}
+        best = better(best, fcand)
         tries += 1
         if _good_enough(best["row"]) or tries >= MAX_GPT_TRIES:
             return finalize(best, tries)
@@ -662,7 +789,7 @@ if gt_key:
     s = gt_bytes.decode("utf-8", errors="ignore")
     reader = csv.DictReader(s.splitlines())
     for row in reader:
-        fn = (row.get("file") or "").strip()
+        fn = (row.get("file") or row.get("file_name") or "").strip()
         if not fn: continue
         gt_rows_raw[fn] = {k: (row.get(k) if row.get(k) not in ["", None] else None) for k in row.keys()}
     dprint(f"🟢 Ground truth loaded: {len(gt_rows_raw)} rows from '{gt_key}'")
@@ -740,6 +867,28 @@ for i, fname in enumerate(image_files, 1):
 print("\n✅ DONE. Batch summary:")
 print(json.dumps(rows, ensure_ascii=False, indent=2))
 print(f"\n📄 CSV: {OUT_CSV}\n🧾 JSONL: {OUT_JSONL}")
+
+print("\n🪪 Passport data:")
+for fname in image_files:
+    out3 = (json_results.get(fname) or {}).get("3", {}) or {}
+    passport_info = {
+        "file_name": canon_key(fname),
+        "country": out3.get("country"),
+        "date_of_birth": out3.get("date_of_birth"),
+        "expiration_date": out3.get("expiration_date"),
+        "mrz": out3.get("mrz"),
+        "mrz_type": out3.get("mrz_type"),
+        "names": out3.get("names"),
+        "nationality": out3.get("nationality"),
+        "number": out3.get("number"),
+        "sex": out3.get("sex"),
+        "surname": out3.get("surname"),
+    }
+    print("\n────────────")
+    for key, value in passport_info.items():
+        if value is None:
+            value = ""
+        print(f"[{key}] => {value}")
 
 if gt_rows_raw:
     print("\n📊 Ground Truth metrics per field:")
