@@ -110,16 +110,35 @@ def yymmdd_to_ddmmyyyy(s):
     except: return None
 
 def _split_name_safely(namefld: str):
-    if "<<" in namefld:
-        left, right = namefld.split("<<", 1)
-    elif "<" in namefld:
-        m = re.search(r"<+", namefld)
-        left, right = namefld[:m.start()], namefld[m.end():]
+    if not namefld:
+        return None, None
+
+    # відкидаємо службові заповнювачі в кінці, але лишаємо потенційні помилки OCR
+    core = namefld.rstrip("<")
+    if not core:
+        return None, None
+
+    # шукаємо першу пару «<<», яка розділяє прізвище та ім'я (не заповнювач «<<<<»)
+    split_at = None
+    for m in re.finditer(r"<<", core):
+        prev = core[m.start()-1] if m.start() > 0 else ""
+        nxt = core[m.end()] if m.end() < len(core) else ""
+        if prev != '<' and nxt != '<':
+            split_at = m.start()
+            break
+
+    if split_at is not None:
+        left = core[:split_at]
+        right = core[split_at+2:]
+    elif "<" in core:
+        m = re.search(r"<+", core)
+        left, right = core[:m.start()], core[m.end():]
     else:
-        return namefld.replace("<","") or None, None
+        left, right = core, ""
+
     surname = left.replace("<","").strip() or None
-    given = re.sub(r"<+", " ", right).strip()
-    given = re.sub(r"\s+", " ", given) or None
+    given_raw = re.sub(r"<+", " ", right).strip()
+    given = re.sub(r"\s+", " ", given_raw) or None
     return surname, given
 
 def _score(pass_doc, pass_dob, pass_exp, pass_pid, pass_fin):
@@ -318,8 +337,17 @@ def _normalize_and_score(picked, fallback_note=None):
 
         # попередження про одношевронні імена
         namefld = norm[0][5:44]
-        if "<<" not in namefld and "<" in namefld:
+        name_core = namefld.rstrip("<")
+        if name_core and "<<" not in name_core and "<" in name_core:
             issue_tags.append("name_single_chevron")
+
+        preview_surname, preview_given = _split_name_safely(namefld)
+        if preview_given:
+            tokens = [t for t in re.split(r"\s+", preview_given) if t]
+            single_letter_tokens = [t for t in tokens if len(t) == 1]
+            repetitive_tokens = [t for t in tokens if re.fullmatch(r"(.)\1{2,}", t)]
+            if (len(single_letter_tokens) >= 3 or repetitive_tokens) and "name_noise_tokens" not in issue_tags:
+                issue_tags.append("name_noise_tokens")
 
         # найкращий L2 за checksum-score
         best = _best_l2_by_score(norm[1])
@@ -350,9 +378,18 @@ def _normalize_and_score(picked, fallback_note=None):
     pass_fin = out3.get("final_pass")
     return result_json, norm, issue_tags, valid_score, pass_doc, pass_fin
 
+def _issue_set(row_core):
+    if not row_core:
+        return set()
+    issues = row_core.get("issues") or ""
+    return {p for p in issues.split("|") if p}
+
+FORCE_GPT_ISSUES = {"name_single_chevron", "name_noise_tokens"}
+
 def _weak(row_core):
     if row_core is None: return True
     if WEAK_IF_NO_PICK and not row_core.get("picked"): return True
+    if _issue_set(row_core) & FORCE_GPT_ISSUES: return True
     if REQUIRE_DOC_AND_FINAL and (row_core.get("doc_pass") is False and row_core.get("fin_pass") is False):
         return True
     vs = row_core.get("valid_score")
@@ -362,6 +399,8 @@ def _weak(row_core):
 def _good_enough(row_core):
     if row_core is None: return False
     vs = row_core.get("valid_score") or 0
+    if _issue_set(row_core) & FORCE_GPT_ISSUES:
+        return False
     return (vs >= EARLY_STOP_SCORE) and (row_core.get("doc_pass") is True and row_core.get("fin_pass") is True)
 
 def run_gpt_on_roi(pil_img, idx, total, print_raw=True):
@@ -668,7 +707,7 @@ if gt_key:
     s = gt_bytes.decode("utf-8", errors="ignore")
     reader = csv.DictReader(s.splitlines())
     for row in reader:
-        fn = (row.get("file") or "").strip()
+        fn = (row.get("file") or row.get("file_name") or "").strip()
         if not fn: continue
         gt_rows_raw[fn] = {k: (row.get(k) if row.get(k) not in ["", None] else None) for k in row.keys()}
     dprint(f"🟢 Ground truth loaded: {len(gt_rows_raw)} rows from '{gt_key}'")
