@@ -1,11 +1,11 @@
 # ==== MRZ Batch v2.5 ===========================================
 # Цілі:
 # 1) Стабільність: Tesseract → якщо валідно по checksum → приймаємо, GPT не викликаємо.
-# 2) Лише якщо слабко: GPT як fallback (1 ROI, 0°; за потреби 180°; за потреби легкий preproc).
+# 2) Лише якщо слабко: GPT як fallback (1 ROI, 0°; за потреби легкий preproc).
 # 3) Ранній вихід: як тільки valid_score >= 80 і doc/final пройшли — стоп.
 # 4) Обмеження витрат: максимум 3-4 виклики моделі на файл.
 # 5) Посилений system prompt, щоб уникати «вигаданих» GBR/UTO і т.п.
-# 6) Ротація й препроцесинг — суворо умовні.
+# 6) Препроцесинг — суворо умовний.
 
 !pip -q install --upgrade openai pillow pytesseract opencv-python-headless
 !apt -qq update && apt -qq install -y tesseract-ocr >/dev/null
@@ -33,8 +33,7 @@ OUT_METRICS = "/content/mrz_gt_metrics.json"
 
 # ---- Стратегія спроб ----
 EARLY_STOP_SCORE = 80              # як тільки >=80 і doc/final пройшли — стоп
-MAX_GPT_TRIES = 3                  # максимум викликів GPT на файл (base0, rot180, preproc0)
-USE_ROTATION_180_IF_WEAK = True    # дозволяти 180° тільки якщо слабко
+MAX_GPT_TRIES = 3                  # максимум викликів GPT на файл (base0 + опційний preproc)
 USE_PREPROC_IF_WEAK = True         # дозволяти легкий preproc тільки якщо слабко
 
 # Пороги «слабко»:
@@ -270,9 +269,6 @@ def preprocess_for_mrz(pil_img: Image.Image) -> Image.Image:
     out = ImageOps.autocontrast(out)
     return out
 
-def rotate_180(img: Image.Image) -> Image.Image:
-    return img.rotate(180, expand=True, resample=Image.BICUBIC)
-
 # ================== НОРМАЛІЗАЦІЯ/ОЦІНКА ==================
 def _normalize_and_score(picked, fallback_note=None):
     repair_meta = None
@@ -444,7 +440,7 @@ def process_one_v25(fname, data_bytes, idx, total):
                 "file": fname, "api_s": 0.0, "total_s": round(T1-T0,3), "jpeg_kb": None, "tokens_total": 0,
                 "picked": 1, "fallback": "tesseract", "repair_strategy": "as_is",
                 "valid_score": t_row["valid_score"], "doc_pass": t_row["doc_pass"], "fin_pass": t_row["fin_pass"],
-                "issues": t_row["issues"], "rotation_used": 0, "preproc_used": 0, "extra_tries": 0
+                "issues": t_row["issues"], "preproc_used": 0, "extra_tries": 0
             }
             meta_final = {"file": fname, "picked_variant": "tesseract", **(t_pack[0] or {})}
             return out_row, meta_final, t_pack[1]
@@ -453,7 +449,7 @@ def process_one_v25(fname, data_bytes, idx, total):
     tries = 0
     base0 = set_dbg(base_img.copy(), f"{fname} | base0")
     row_core, meta_core, result_json = run_gpt_on_roi(base0, idx, total, print_raw=True)
-    best = {"row": row_core, "meta": meta_core, "json": result_json, "label": "base0", "rot": 0, "pre": 0}
+    best = {"row": row_core, "meta": meta_core, "json": result_json, "label": "base0", "pre": 0}
     tries += 1
     if _good_enough(best["row"]) or tries >= MAX_GPT_TRIES:
         T1 = time.time()
@@ -463,39 +459,20 @@ def process_one_v25(fname, data_bytes, idx, total):
             "picked": best["row"]["picked"], "fallback": best["row"]["fallback"],
             "repair_strategy": "as_is", "valid_score": best["row"]["valid_score"],
             "doc_pass": best["row"]["doc_pass"], "fin_pass": best["row"]["fin_pass"],
-            "issues": best["row"]["issues"], "rotation_used": best["rot"], "preproc_used": best["pre"],
+            "issues": best["row"]["issues"], "preproc_used": best["pre"],
             "extra_tries": tries-1
         }, {"file": fname, "picked_variant": best["label"], **best["meta"]}, best["json"]
 
-    # 2) Якщо слабко → 180°
+    # 2) Якщо все ще слабко → легкий препроцесинг 0°
     def better(a,b):
         av = a["row"]["valid_score"] or 0
         bv = b["row"]["valid_score"] or 0
         return a if av >= bv else b
 
-    if USE_ROTATION_180_IF_WEAK and _weak(best["row"]) and tries < MAX_GPT_TRIES:
-        rot180 = set_dbg(rotate_180(base_img), f"{fname} | rot180")
-        r_row, r_meta, r_json = run_gpt_on_roi(rot180, idx, total, print_raw=False)
-        cand = {"row": r_row, "meta": r_meta, "json": r_json, "label": "rot180", "rot": 180, "pre": 0}
-        best = better(best, cand)
-        tries += 1
-        if _good_enough(best["row"]) or tries >= MAX_GPT_TRIES:
-            T1 = time.time()
-            return {
-                "file": fname, "api_s": best["row"]["api_s"], "total_s": round(T1-T0,3),
-                "jpeg_kb": best["row"]["jpeg_kb"], "tokens_total": best["row"]["tokens_total"],
-                "picked": best["row"]["picked"], "fallback": best["row"]["fallback"],
-                "repair_strategy": "as_is", "valid_score": best["row"]["valid_score"],
-                "doc_pass": best["row"]["doc_pass"], "fin_pass": best["row"]["fin_pass"],
-                "issues": best["row"]["issues"], "rotation_used": best["rot"], "preproc_used": best["pre"],
-                "extra_tries": tries-1
-            }, {"file": fname, "picked_variant": best["label"], **best["meta"]}, best["json"]
-
-    # 3) Якщо все ще слабко → легкий препроцесинг 0°
     if USE_PREPROC_IF_WEAK and _weak(best["row"]) and tries < MAX_GPT_TRIES:
         pre0 = set_dbg(preprocess_for_mrz(base_img), f"{fname} | pre0")
         p_row, p_meta, p_json = run_gpt_on_roi(pre0, idx, total, print_raw=False)
-        pcand = {"row": p_row, "meta": p_meta, "json": p_json, "label": "pre0", "rot": 0, "pre": 1}
+        pcand = {"row": p_row, "meta": p_meta, "json": p_json, "label": "pre0", "pre": 1}
         best = better(best, pcand)
         tries += 1
 
@@ -506,7 +483,7 @@ def process_one_v25(fname, data_bytes, idx, total):
         "picked": best["row"]["picked"], "fallback": best["row"]["fallback"],
         "repair_strategy": "as_is", "valid_score": best["row"]["valid_score"],
         "doc_pass": best["row"]["doc_pass"], "fin_pass": best["row"]["fin_pass"],
-        "issues": best["row"]["issues"], "rotation_used": best["rot"], "preproc_used": best["pre"],
+        "issues": best["row"]["issues"], "preproc_used": best["pre"],
         "extra_tries": tries-1
     }
     meta_final = {"file": fname, "picked_variant": best["label"], **best["meta"]}
@@ -612,7 +589,7 @@ gt_by_file, gt_by_file_name = build_gt_indexes(gt_rows_raw)
 csv_fields = [
     "file","api_s","total_s","jpeg_kb","tokens_total",
     "picked","fallback","repair_strategy","valid_score","doc_pass","fin_pass",
-    "issues","rotation_used","preproc_used","extra_tries"
+    "issues","preproc_used","extra_tries"
 ]
 GT_FIELDS = ["country","date_of_birth","expiration_date","mrz","mrz_type","names","nationality","number","sex","surname"]
 if gt_rows_raw:
